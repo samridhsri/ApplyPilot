@@ -7,7 +7,7 @@ and exports to PDF using headless Chromium via Playwright.
 import logging
 from pathlib import Path
 
-from applypilot.config import TAILORED_DIR
+from applypilot.config import TAILORED_DIR, read_text_safe
 
 log = logging.getLogger(__name__)
 
@@ -372,7 +372,7 @@ def convert_to_pdf(
         Path to the generated PDF (or HTML) file.
     """
     text_path = Path(text_path)
-    text = text_path.read_text(encoding="utf-8")
+    text = read_text_safe(text_path)
     resume = parse_resume(text)
     html = build_html(resume)
 

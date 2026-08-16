@@ -5,6 +5,7 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+FDE*
 
 # Runtime artifacts
 *.db
@@ -19,6 +20,8 @@ logs/
 .mcp*.json
 
 # Python
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -26,6 +29,9 @@ __pycache__/
 dist/
 build/
 *.egg
+
+# Node.js
+node_modules/
 
 # IDE
 .vscode/
@@ -37,5 +43,5 @@ build/
 .DS_Store
 Thumbs.db
 
-# Claude Code
+# Claude Code & AI
 .claude/

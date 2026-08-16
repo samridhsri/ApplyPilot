@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
+from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile, read_text_safe
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -198,7 +198,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         {"generated": int, "errors": int, "elapsed": float}
     """
     profile = load_profile()
-    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    resume_text = read_text_safe(RESUME_PATH)
     conn = get_connection()
 
     # Fetch jobs that have tailored resumes but no cover letter yet

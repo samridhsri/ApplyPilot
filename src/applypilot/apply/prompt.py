@@ -466,9 +466,9 @@ def build_prompt(job: dict, tailored_resume: str,
         # Read text from .txt sibling (PDF is binary)
         cl_txt = cl_src.with_suffix(".txt")
         if cl_txt.exists():
-            cover_letter_text = cl_txt.read_text(encoding="utf-8")
+            cover_letter_text = config.read_text_safe(cl_txt)
         elif cl_src.suffix == ".txt":
-            cover_letter_text = cl_src.read_text(encoding="utf-8")
+            cover_letter_text = config.read_text_safe(cl_src)
         # Upload must be PDF
         cl_pdf_src = cl_src.with_suffix(".pdf")
         if cl_pdf_src.exists():

@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from applypilot.config import RESUME_PATH, load_profile
+from applypilot.config import RESUME_PATH, load_env, load_profile, read_text_safe
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
@@ -111,7 +111,8 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
-    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    load_env()
+    resume_text = read_text_safe(RESUME_PATH)
     conn = get_connection()
 
     if rescore:
@@ -155,10 +156,17 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
+        if r["score"] > 0:
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            )
+        else:
+            # On error (score 0), record the reasoning without setting fit_score so it remains pending
+            conn.execute(
+                "UPDATE jobs SET score_reasoning = ? WHERE url = ?",
+                (f"{r['keywords']}\n{r['reasoning']}", r["url"]),
+            )
     conn.commit()
 
     elapsed = time.time() - t0
