@@ -97,6 +97,7 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    rescore: bool = typer.Option(False, "--rescore", help="Re-score all jobs even if already scored."),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
@@ -136,6 +137,7 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        rescore=rescore,
     )
 
     if result.get("errors"):
@@ -147,7 +149,8 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    runner: Optional[str] = typer.Option(None, "--runner", "-r", help="AI CLI runner to use ('agy' or 'claude')."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model name for the CLI session."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -161,10 +164,10 @@ def apply(
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import check_tier, get_apply_runner, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
-    # --- Utility modes (no Chrome/Claude needed) ---
+    # --- Utility modes (no Chrome/CLI needed) ---
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
@@ -186,8 +189,11 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (agy/claude CLI + Chrome)
     check_tier(3, "auto-apply")
+
+    selected_runner = (runner or get_apply_runner()).lower()
+    selected_model = model or ("gemini-3.7-flash" if selected_runner == "agy" else "haiku")
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -216,15 +222,19 @@ def apply(
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        prompt_file = gen_prompt(target, min_score=min_score, model=selected_model)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print(f"\n[bold]Run manually with agy:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
+            f"  agy -p --dangerously-skip-permissions --model {selected_model} < {prompt_file}"
+        )
+        console.print(f"\n[bold]Run manually with claude:[/bold]")
+        console.print(
+            f"  claude --model {selected_model} -p "
             f"--mcp-config {mcp_path} "
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
@@ -235,9 +245,10 @@ def apply(
     effective_limit = limit if limit is not None else (0 if continuous else 1)
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
+    console.print(f"  Runner:   {selected_runner}")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Model:    {selected_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -249,7 +260,8 @@ def apply(
         target_url=url,
         min_score=min_score,
         headless=headless,
-        model=model,
+        model=selected_model,
+        runner=selected_runner,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
@@ -333,6 +345,23 @@ def dashboard() -> None:
 
 
 @app.command()
+def ui(
+    port: int = typer.Option(8000, "--port", "-p", help="Port to run the dashboard server on."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface to bind to."),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not automatically open the browser."),
+) -> None:
+    """Launch the interactive React job tracking dashboard."""
+    import webbrowser
+    _bootstrap()
+    from applypilot.server import run_server
+
+    url = f"http://{host}:{port}"
+    if not no_open:
+        webbrowser.open(url)
+    run_server(port=port, host=host)
+
+
+@app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
@@ -383,7 +412,15 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    agy_bin = shutil.which("agy") or (
+        str(Path(os.path.expanduser("~/.local/bin/agy")))
+        if Path(os.path.expanduser("~/.local/bin/agy")).exists()
+        else None
+    )
+
+    if agy_bin and not (has_gemini or has_openai or has_local):
+        results.append(("LLM Provider", ok_mark, "Antigravity Agent (agy)"))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_openai:
@@ -391,18 +428,28 @@ def doctor() -> None:
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+    elif agy_bin:
+        results.append(("LLM Provider", ok_mark, "Antigravity Agent (agy)"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("LLM Provider", fail_mark,
+                        "Set GEMINI_API_KEY, OPENAI_API_KEY, LLM_URL, or install Antigravity CLI (agy)"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
+    # agy CLI or Claude Code CLI
+    agy_bin = shutil.which("agy") or (
+        str(Path(os.path.expanduser("~/.local/bin/agy")))
+        if Path(os.path.expanduser("~/.local/bin/agy")).exists()
+        else None
+    )
     claude_bin = shutil.which("claude")
-    if claude_bin:
+
+    if agy_bin:
+        results.append(("Antigravity CLI (agy)", ok_mark, agy_bin))
+    elif claude_bin:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("AI CLI (agy/Claude)", fail_mark,
+                        "Install agy CLI or Claude Code CLI (needed for auto-apply)"))
 
     # Chrome
     try:
@@ -446,9 +493,9 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agy/Claude CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agy/Claude CLI + Chrome + Node.js)[/dim]")
 
     console.print()
 

@@ -2,6 +2,7 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
+  LLM_PROVIDER    -> "antigravity" (or auto-detected when agy is available)
   GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
@@ -11,31 +12,99 @@ LLM_MODEL env var overrides the model name for any provider.
 
 import logging
 import os
+import shutil
+import subprocess
 import time
+from pathlib import Path
 
 import httpx
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Antigravity CLI binary discovery
+# ---------------------------------------------------------------------------
+
+def find_agy_binary() -> str | None:
+    """Find the path to the agy CLI executable."""
+    env_agy = os.environ.get("AGY_PATH")
+    if env_agy and os.path.exists(env_agy):
+        return env_agy
+
+    found = shutil.which("agy")
+    if found:
+        return found
+
+    candidates = [
+        Path.home() / ".local" / "bin" / "agy",
+        Path.home() / "bin" / "agy",
+        Path("/usr/local/bin/agy"),
+        Path("/usr/bin/agy"),
+    ]
+    for c in candidates:
+        if c.exists() and os.access(c, os.X_OK):
+            return str(c)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Provider detection
 # ---------------------------------------------------------------------------
 
 def _detect_provider() -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) based on environment variables.
+    """Return (base_url, model, api_key_or_path) based on environment variables.
 
     Reads env at call time (not module import time) so that load_env() called
     in _bootstrap() is always visible here.
     """
+    from applypilot.config import load_env
+    load_env()
+
+    provider_override = os.environ.get("LLM_PROVIDER", "").lower()
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
+    # Explicit provider selection
+    if provider_override in ("gemini", "google"):
+        if gemini_key:
+            return (
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                model_override or "gemini-3.5-flash",
+                gemini_key,
+            )
+        raise RuntimeError("LLM_PROVIDER=gemini specified but GEMINI_API_KEY is not set.")
+
+    if provider_override in ("openai", "gpt"):
+        if openai_key:
+            return (
+                "https://api.openai.com/v1",
+                model_override or "gpt-4o-mini",
+                openai_key,
+            )
+        raise RuntimeError("LLM_PROVIDER=openai specified but OPENAI_API_KEY is not set.")
+
+    if provider_override in ("local", "ollama", "llamacpp"):
+        if local_url:
+            return (
+                local_url.rstrip("/"),
+                model_override or "local-model",
+                os.environ.get("LLM_API_KEY", ""),
+            )
+        raise RuntimeError("LLM_PROVIDER=local specified but LLM_URL is not set.")
+
+    # Default to Antigravity if agy binary is present
+    agy_path = find_agy_binary()
+    if agy_path and provider_override != "api":
+        return ("antigravity", model_override or "default", agy_path)
+
+    # Fallback to API keys if agy is not available
     if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
+            model_override or "gemini-3.5-flash",
             gemini_key,
         )
 
@@ -55,7 +124,7 @@ def _detect_provider() -> tuple[str, str, str]:
 
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set GEMINI_API_KEY, OPENAI_API_KEY, LLM_URL, or ensure Antigravity CLI (agy) is available."
     )
 
 
@@ -170,9 +239,9 @@ class LLMClient:
             headers=headers,
         )
 
-        # 403 on Gemini compat = model not available on compat layer.
+        # 403 or 404 on Gemini compat = model not available on compat layer.
         # Raise a specific sentinel so chat() can switch to native API.
-        if resp.status_code == 403 and self._is_gemini:
+        if resp.status_code in (403, 404) and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
         return self._handle_compat_response(resp)
@@ -210,9 +279,10 @@ class LLMClient:
             except _GeminiCompatForbidden as exc:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
-                    "Gemini compat endpoint returned 403 for model '%s'. "
+                    "Gemini compat endpoint returned %d for model '%s'. "
                     "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
+                    "(Preview/experimental models are often only supported via native API.)",
+                    exc.response.status_code,
                     self.model,
                 )
                 self._use_native_gemini = True
@@ -221,7 +291,7 @@ class LLMClient:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
                 except httpx.HTTPStatusError as native_exc:
                     raise RuntimeError(
-                        f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
+                        f"Both Gemini endpoints failed. Compat: {exc.response.status_code}. "
                         f"Native: {native_exc.response.status_code} — "
                         f"{native_exc.response.text[:200]}"
                     ) from native_exc
@@ -273,25 +343,114 @@ class LLMClient:
         self._client.close()
 
 
+class AntigravityClient:
+    """LLM client powered directly by the local Antigravity agent (agy CLI / SDK).
+
+    Requires no external API keys or paid credits. Executes prompts through
+    the user's authenticated Antigravity agent session.
+    """
+
+    def __init__(self, agy_path: str, model: str = "") -> None:
+        self.agy_path = agy_path
+        self.model = model
+
+    def _build_prompt(self, messages: list[dict]) -> str:
+        """Combine OpenAI-style messages into a clear prompt for the agent."""
+        system_prompts = []
+        user_prompts = []
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_prompts.append(content)
+            elif role == "user":
+                user_prompts.append(content)
+            elif role == "assistant":
+                user_prompts.append(f"Assistant previous output:\n{content}")
+
+        if not system_prompts and len(user_prompts) == 1:
+            return user_prompts[0]
+
+        parts = []
+        if system_prompts:
+            parts.append("INSTRUCTIONS:\n" + "\n\n".join(system_prompts))
+        if user_prompts:
+            parts.append("INPUT:\n" + "\n\n".join(user_prompts))
+
+        return "\n\n---\n\n".join(parts)
+
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> str:
+        """Execute chat completion via Antigravity agent CLI."""
+        prompt = self._build_prompt(messages)
+        return self.ask(prompt, temperature=temperature, max_tokens=max_tokens)
+
+    def ask(self, prompt: str, **kwargs) -> str:
+        """Execute a single prompt via Antigravity agent CLI."""
+        cmd = [self.agy_path, "--dangerously-skip-permissions", "--print", prompt]
+        if self.model and self.model != "default":
+            cmd.extend(["--model", self.model])
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=_TIMEOUT,
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip()
+
+                log.warning(
+                    "Antigravity CLI returned exit code %d (attempt %d/%d): %s",
+                    result.returncode,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    result.stderr[:200] if result.stderr else result.stdout[:200],
+                )
+            except subprocess.TimeoutExpired:
+                log.warning("Antigravity CLI call timed out (attempt %d/%d)", attempt + 1, _MAX_RETRIES)
+            except Exception as e:
+                log.error("Antigravity CLI execution error: %s", e)
+
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(2 * (attempt + 1))
+
+        raise RuntimeError("Antigravity agent execution failed after retries")
+
+    def close(self) -> None:
+        pass
+
+
 class _GeminiCompatForbidden(Exception):
-    """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
+    """Sentinel: Gemini OpenAI-compat returned 403 or 404. Switch to native API."""
     def __init__(self, response: httpx.Response) -> None:
         self.response = response
-        super().__init__(f"Gemini compat 403: {response.text[:200]}")
+        super().__init__(f"Gemini compat {response.status_code}: {response.text[:200]}")
 
 
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
 
-_instance: LLMClient | None = None
+_instance: LLMClient | AntigravityClient | None = None
 
 
-def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
+def get_client() -> LLMClient | AntigravityClient:
+    """Return (or create) the module-level LLMClient or AntigravityClient singleton."""
     global _instance
     if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+        base_url_or_provider, model, api_key_or_path = _detect_provider()
+        if base_url_or_provider == "antigravity":
+            log.info("LLM provider: Antigravity Agent (%s)  model: %s", api_key_or_path, model)
+            _instance = AntigravityClient(agy_path=api_key_or_path, model=model)
+        else:
+            log.info("LLM provider: %s  model: %s", base_url_or_provider, model)
+            _instance = LLMClient(base_url_or_provider, model, api_key_or_path)
     return _instance

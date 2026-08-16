@@ -85,6 +85,17 @@ def get_chrome_user_data() -> Path:
         return Path.home() / ".config" / "google-chrome"
 
 
+def read_text_safe(path: Path) -> str:
+    """Read a text file, trying UTF-8 first, falling back to cp1252/latin-1, and finally using replacement characters."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return path.read_text(encoding="cp1252")
+        except UnicodeDecodeError:
+            return path.read_text(encoding="utf-8", errors="replace")
+
+
 def ensure_dirs():
     """Create all required directories."""
     for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
@@ -197,27 +208,44 @@ TIER_COMMANDS: dict[int, list[str]] = {
 }
 
 
+def get_apply_runner() -> str:
+    """Return the auto-apply runner to use: 'agy' or 'claude'."""
+    load_env()
+    runner = os.environ.get("APPLY_RUNNER", "").lower()
+    if runner in ("agy", "claude"):
+        return runner
+    if shutil.which("agy") or Path(os.path.expanduser("~/.local/bin/agy")).exists():
+        return "agy"
+    if shutil.which("claude"):
+        return "claude"
+    return "agy"
+
+
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
     Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 2 (AI Scoring & Tailoring): + (LLM API key or Antigravity agy CLI)
+    Tier 3 (Full Auto-Apply):       + (agy or claude CLI) + Chrome
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_agy = (
+        shutil.which("agy") is not None
+        or Path(os.path.expanduser("~/.local/bin/agy")).exists()
+    )
+    has_llm = has_agy or any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
+    has_cli = has_agy or shutil.which("claude") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_cli and has_chrome:
         return 3
 
     return 2
@@ -237,12 +265,18 @@ def check_tier(required: int, feature: str) -> None:
     from rich.console import Console
     _console = Console(stderr=True)
 
+    has_agy = (
+        shutil.which("agy") is not None
+        or Path(os.path.expanduser("~/.local/bin/agy")).exists()
+    )
+
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not (has_agy or any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))):
+        missing.append("LLM provider — set GEMINI_API_KEY, OPENAI_API_KEY, LLM_URL, or install Antigravity CLI (agy)")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        has_cli = has_agy or shutil.which("claude") is not None
+        if not has_cli:
+            missing.append("AI CLI (agy or Claude Code) — install agy CLI or Claude CLI")
         try:
             get_chrome_path()
         except FileNotFoundError:
