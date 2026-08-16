@@ -177,7 +177,8 @@ applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
 applypilot status                       # Pipeline statistics
-applypilot dashboard                    # Open HTML results dashboard
+applypilot dashboard                    # Open static HTML results dashboard
+applypilot ui                           # Launch interactive React job tracking dashboard
 ```
 
 ---
