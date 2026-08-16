@@ -226,7 +226,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
     resume_text = ""
     if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
+        resume_text = config.read_text_safe(txt_path)
 
     prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
 
@@ -295,8 +295,9 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+            model: str = "gemini-3.7-flash", runner: str = "agy",
+            dry_run: bool = False) -> tuple[str, int]:
+    """Spawn an agy or Claude Code session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
@@ -308,7 +309,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
     resume_text = ""
     if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
+        resume_text = config.read_text_safe(txt_path)
 
     # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
@@ -321,27 +322,36 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
+    # Build CLI command based on selected runner
+    if runner == "agy":
+        agy_exe = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+        cmd = [
+            str(agy_exe),
+            "-p",
+            "--dangerously-skip-permissions",
+            "--model", model,
+        ]
+    else:  # claude
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p",
+            "--mcp-config", str(mcp_config_path),
+            "--permission-mode", "bypassPermissions",
+            "--no-session-persistence",
+            "--disallowedTools", (
+                "mcp__gmail__draft_email,mcp__gmail__modify_email,"
+                "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
+                "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
+                "mcp__gmail__create_label,mcp__gmail__update_label,"
+                "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
+                "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
+                "mcp__gmail__list_filters,mcp__gmail__get_filter,"
+                "mcp__gmail__delete_filter"
+            ),
+            "--output-format", "stream-json",
+            "--verbose", "-",
+        ]
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
@@ -548,7 +558,8 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "gemini-3.7-flash", runner: str = "agy",
+                dry_run: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -557,7 +568,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Model name for the session.
+        runner: AI runner to use ('agy' or 'claude').
         dry_run: Don't click Submit.
 
     Returns:
@@ -602,7 +614,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+                                          model=model, runner=runner,
+                                          dry_run=dry_run)
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -651,7 +664,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 7, headless: bool = False,
+         model: str = "gemini-3.7-flash", runner: str = "agy",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1) -> None:
     """Launch the apply pipeline.
@@ -661,7 +675,8 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Model name.
+        runner: AI runner to use ('agy' or 'claude').
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
@@ -686,7 +701,7 @@ def main(limit: int = 1, target_url: str | None = None,
         init_worker(i)
 
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
-    console.print(f"Launching apply pipeline ({mode_label}, {worker_label}, poll every {POLL_INTERVAL}s)...")
+    console.print(f"Launching apply pipeline ({runner}, {mode_label}, {worker_label}, poll every {POLL_INTERVAL}s)...")
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
     # Double Ctrl+C handler
@@ -697,7 +712,7 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
+            # Kill all active CLI processes to skip current jobs
             with _claude_lock:
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:
@@ -736,6 +751,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     min_score=min_score,
                     headless=headless,
                     model=model,
+                    runner=runner,
                     dry_run=dry_run,
                 )
             else:
@@ -759,6 +775,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             min_score=min_score,
                             headless=headless,
                             model=model,
+                            runner=runner,
                             dry_run=dry_run,
                         ): i
                         for i in range(workers)
